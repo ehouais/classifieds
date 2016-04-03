@@ -1,12 +1,55 @@
 <?php
+class URI {
+    private static $root;
+    private $pattern;
+
+    public static function setRoot($str) {
+        self::$root = $str;
+    }
+    function __construct($pattern) {
+        $this->pattern = $pattern;
+    }
+    public function value($vars = null) {
+        $str = $this->pattern;
+        if ($vars) {
+            $str = preg_replace_callback(
+                "/\{([^\}]+)\}/",
+                function($matches) use ($vars) { return $vars[$matches[1]]; },
+                $str
+            );
+        }
+        return self::$root.(substr(self::$root, -1) == "/" ? "" : "/").$str;
+    }
+    public function match($str) {
+        $regexp = preg_replace("/\{[^\}]+\}/", "([^/]+)", $this->pattern); // replace named vars in pattern by generic regexp expression
+        if (preg_match("@^".$regexp."$@", $str, $matches)) {
+            preg_match_all("/\{([^\}]+)\}/", $this->pattern, $vars); // get ordered var names in pattern
+            $result = array();
+            for ($i = 0; $i < count($vars[1]); $i++) {
+                $result[$vars[1][$i]] = $matches[$i+1];
+            }
+            return $result;
+        }
+    }
+}
+
 class Request {
     private static $method;
     private static $accept;
     private static $body;
     private static $root;
     private static $path;
+    // Replaces "\uxxxx" sequences by true UTF-8 multibyte characters
+    private static function unicodeSeqtoMb($str) {
+        return html_entity_decode(preg_replace("/\\\u([0-9a-f]{4})/", "&#x\\1;", $str), ENT_NOQUOTES, 'UTF-8');
+    }
     private static function toJson($data) {
-        return defined('JSON_UNESCAPED_SLASHES') ? json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) : str_replace("\/", "/", json_encode($data));
+        // if PHP version >= 5.4.0, piece of cake
+        if (defined('JSON_UNESCAPED_SLASHES')) return json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        // else first JSON_UNESCAPED_SLASHES polyfill...
+        $data = str_replace("\/", "/", json_encode($data));
+        /// ...then JSON_UNESCAPED_UNICODE polyfill
+        return self::unicodeSeqtoMb($data);
     }
     private static function prettifyJson($json) {
         $result = '';
@@ -61,8 +104,6 @@ class Request {
         return $result;
     }
 
-    // Public functions -------------------------------------------------------
-
     public static function init() {
         // HTTP method
         self::$method = strtoupper($_SERVER["REQUEST_METHOD"]);
@@ -104,12 +145,12 @@ class Request {
     public static function error400($msg) {
         self::error("HTTP/1.1 400 Bad Request", $msg);
     }
+    public static function error404() {
+        self::error("HTTP/1.1 404 Not Found", "");
+    }
     public static function error401($type, $realm, $msg) {
         header("WWW-Authenticate: ".$type." realm=\"".$realm."\"");
         self::error("HTTP/1.1 401 Not Authorized", $msg);
-    }
-    public static function error404() {
-        self::error("HTTP/1.1 404 Not Found", "");
     }
     public static function error500($msg) {
         self::error("HTTP/1.1 500 Internal Server Error", $msg);
@@ -122,7 +163,6 @@ class Request {
                 if (preg_match("/".str_replace(array(".", "*"), array("\.", "[^\.]+"), $pattern)."/", $domain, $matches)) {
                     header("Access-Control-Allow-Origin: ".$_SERVER['HTTP_ORIGIN']);
                     header("Access-Control-Allow-Credentials: true");
-                    header("Vary: Origin");
                     break;
                 }
             }
@@ -146,20 +186,25 @@ class Request {
             $cb();
         }
     }
-    public static function bind($pattern, $handlers, $context = null) {
+    public static function match($uri, $handlers, $context = null) {
         if (!is_array($handlers)) {
             $handlers = array("GET" => $handlers);
         }
-        $matches = null;
-        if (($pattern == "" && self::$path == "") || ($pattern && preg_match($pattern, self::$path, $matches))) {
-            if (isset($handlers[self::$method])) $handler = $handlers[self::$method];
-            elseif (self::$method != "OPTIONS" && isset($handlers["*"])) $handler = $handlers["*"];
+        $match = $uri->match(self::$path);
+        if ($match !== null) {
+            if (isset($handlers[self::$method])) {
+                $handler = $handlers[self::$method];
+            } elseif (self::$method != "OPTIONS" && isset($handlers["*"])) {
+                $handler = $handlers["*"];
+            } else {
+                $handler = null;
+            }
 
-            if (isset($handler)) {
+            if ($handler) {
                 try {
                     ob_start();
                     if (is_callable($handler)) {
-                        $handler($matches);
+                        $handler($match);
                     } else {
                         if ($context) extract($context);
                         include $handler;
@@ -176,9 +221,11 @@ class Request {
         }
     }
     public static function sendJson($json) {
-        header("Vary: Accept");
+        header("Vary: Accept", false);
+        $json = self::unicodeSeqtoMb($json);
         if (self::$accept == "html") {
             header("Content-Type: text/html; charset=utf-8");
+            print "<meta charset=\"utf-8\">";
             print "<pre>".preg_replace("/\"(https?:\/\/[^\"]+)\"/", "<a href=\"$1\">$1</a>", self::prettifyJson($json))."</pre>";
         } else {
             header("Content-Type: application/json; charset=utf-8");
